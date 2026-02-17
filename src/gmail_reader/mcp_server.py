@@ -7,21 +7,37 @@ All security guarantees from the CLI tool apply here.
 
 import asyncio
 import json
-import sys
+import logging
 from typing import Any
 
+from googleapiclient.errors import HttpError
 from mcp.server import Server
-from mcp.types import Tool, TextContent, Resource, ListResourcesResult
+from mcp.types import Tool, TextContent
 
 from gmail_reader.client import get_gmail_service
-from gmail_reader import reports
-from gmail_reader.queries import validate_date_format, validate_date_range
+from gmail_reader.config import MCP_EXPORT_LIMIT
+from gmail_reader.queries import (
+    build_date_query,
+    validate_date_format,
+    validate_date_range,
+    validate_gmail_id,
+    validate_query_length,
+)
+from gmail_reader.reports import (
+    _fetch_all_message_ids,
+    _fetch_all_messages,
+    _parse_body,
+    _parse_headers,
+    _format_date,
+    fetch_labels,
+    fetch_message_details,
+    fetch_message_full_detail,
+    fetch_thread_details,
+)
 
-# Initialize MCP server
+logger = logging.getLogger(__name__)
+
 app = Server("gmail-reader")
-
-# Gmail API has ~2000 char query limit; enforce this before API call
-MAX_QUERY_LENGTH = 2000
 
 
 @app.list_tools()
@@ -143,50 +159,42 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             )
         ]
 
+    try:
+        return await _dispatch_tool(name, arguments, service)
+    except HttpError as e:
+        logger.error("Gmail API error in %s: %s", name, e)
+        return [
+            TextContent(
+                type="text",
+                text=f"Gmail API error: {e}",
+            )
+        ]
+    except Exception as e:
+        logger.exception("Unexpected error in %s", name)
+        return [
+            TextContent(
+                type="text",
+                text=f"Unexpected error: {e}",
+            )
+        ]
+
+
+async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent]:
+    """Route tool call to the appropriate handler."""
+
     if name == "gmail_list":
         max_results = arguments.get("max_results", 50)
-        messages = reports._fetch_all_messages(service, max_results=max_results)
+        messages = _fetch_all_messages(service, max_results=max_results)
 
         if not messages:
             return [TextContent(type="text", text="No messages found.")]
 
-        # Fetch details for each message
-        message_data = []
-        for msg in messages:
-            msg_id = msg["id"]
-            detail = reports.execute_gmail_request(
-                service,
-                lambda: service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=msg_id,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
-                )
-                .execute(),
-            )
-
-            headers = reports._parse_headers(detail.get("payload", {}))
-            internal_date = detail.get("internalDate", "0")
-            snippet = detail.get("snippet", "")
-
-            message_data.append(
-                {
-                    "id": msg_id,
-                    "thread_id": msg.get("threadId", ""),
-                    "date": reports._format_date(internal_date),
-                    "from": headers.get("From", "(unknown)"),
-                    "to": headers.get("To", "(unknown)"),
-                    "subject": headers.get("Subject", "(no subject)"),
-                    "snippet": snippet,
-                }
-            )
+        message_data = fetch_message_details(
+            service, messages, include_thread_id=True
+        )
 
         return [
-            TextContent(
-                type="text", text=json.dumps(message_data, indent=2)
-            )
+            TextContent(type="text", text=json.dumps(message_data, indent=2))
         ]
 
     elif name == "gmail_search":
@@ -196,18 +204,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         if not query:
             return [TextContent(type="text", text="Error: query parameter is required")]
 
-        # Enforce query length limit before hitting API
-        if len(query) > MAX_QUERY_LENGTH:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Error: Query is too long ({len(query)} chars). "
-                    f"Gmail API supports a maximum of {MAX_QUERY_LENGTH} characters. "
-                    "Please shorten your query.",
-                )
-            ]
+        try:
+            validate_query_length(query)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
 
-        messages = reports._fetch_all_messages(
+        messages = _fetch_all_messages(
             service, query=query, max_results=max_results
         )
 
@@ -216,38 +218,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 TextContent(type="text", text=f"No messages found for query: {query}")
             ]
 
-        # Fetch details for each message
-        message_data = []
-        for msg in messages:
-            msg_id = msg["id"]
-            detail = reports.execute_gmail_request(
-                service,
-                lambda: service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=msg_id,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
-                )
-                .execute(),
-            )
-
-            headers = reports._parse_headers(detail.get("payload", {}))
-            internal_date = detail.get("internalDate", "0")
-            snippet = detail.get("snippet", "")
-
-            message_data.append(
-                {
-                    "id": msg_id,
-                    "thread_id": msg.get("threadId", ""),
-                    "date": reports._format_date(internal_date),
-                    "from": headers.get("From", "(unknown)"),
-                    "to": headers.get("To", "(unknown)"),
-                    "subject": headers.get("Subject", "(no subject)"),
-                    "snippet": snippet,
-                }
-            )
+        message_data = fetch_message_details(
+            service, messages, include_thread_id=True
+        )
 
         return [
             TextContent(
@@ -266,19 +239,21 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 TextContent(type="text", text="Error: message_id parameter is required")
             ]
 
-        message = reports.execute_gmail_request(
-            service,
-            lambda: service.users().messages().get(userId="me", id=message_id).execute(),
-        )
+        try:
+            validate_gmail_id(message_id, label="message ID")
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
 
-        headers = reports._parse_headers(message.get("payload", {}))
+        message = fetch_message_full_detail(service, message_id)
+
+        headers = _parse_headers(message.get("payload", {}))
         snippet = message.get("snippet", "")
         internal_date = message.get("internalDate", "0")
         labels = message.get("labelIds", [])
 
         result = {
             "id": message_id,
-            "date": reports._format_date(internal_date),
+            "date": _format_date(internal_date),
             "from": headers.get("From", "(unknown)"),
             "to": headers.get("To", "(unknown)"),
             "subject": headers.get("Subject", "(no subject)"),
@@ -287,18 +262,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         }
 
         if detail_level == "full":
-            text_body, html_body = reports._parse_body(message.get("payload", {}))
+            text_body, html_body = _parse_body(message.get("payload", {}))
             result["text_body"] = text_body
             result["html_body"] = html_body
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     elif name == "gmail_labels":
-        result = reports.execute_gmail_request(
-            service, lambda: service.users().labels().list(userId="me").execute()
-        )
-
-        labels = result.get("labels", [])
+        labels = fetch_labels(service)
 
         if not labels:
             return [TextContent(type="text", text="No labels found.")]
@@ -313,11 +284,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 TextContent(type="text", text="Error: thread_id parameter is required")
             ]
 
-        thread = reports.execute_gmail_request(
-            service,
-            lambda: service.users().threads().get(userId="me", id=thread_id).execute(),
-        )
+        try:
+            validate_gmail_id(thread_id, label="thread ID")
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
 
+        thread = fetch_thread_details(service, thread_id)
         messages = thread.get("messages", [])
 
         if not messages:
@@ -325,14 +297,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
         thread_data = []
         for msg in messages:
-            headers = reports._parse_headers(msg.get("payload", {}))
+            headers = _parse_headers(msg.get("payload", {}))
             snippet = msg.get("snippet", "")
             internal_date = msg.get("internalDate", "0")
 
             thread_data.append(
                 {
                     "id": msg["id"],
-                    "date": reports._format_date(internal_date),
+                    "date": _format_date(internal_date),
                     "from": headers.get("From", "(unknown)"),
                     "subject": headers.get("Subject", "(no subject)"),
                     "snippet": snippet,
@@ -359,19 +331,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             ]
 
-        # Validate dates and range
         try:
             validate_date_format(start_date)
             validate_date_format(end_date)
-            # Reject reversed date ranges early
             validate_date_range(start_date, end_date)
         except ValueError as e:
             return [TextContent(type="text", text=f"Date validation error: {e}")]
 
-        from gmail_reader.queries import build_date_query
-
         query = build_date_query(start_date, end_date)
-        message_ids = reports._fetch_all_message_ids(service, query=query)
+        message_ids = _fetch_all_message_ids(service, query=query)
 
         if not message_ids:
             return [
@@ -381,28 +349,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             ]
 
-        # Warn users when result is truncated at the MCP export limit
-        _MCP_EXPORT_LIMIT = 100
-        truncated = len(message_ids) > _MCP_EXPORT_LIMIT
-        ids_to_fetch = message_ids[:_MCP_EXPORT_LIMIT]
+        truncated = len(message_ids) > MCP_EXPORT_LIMIT
+        ids_to_fetch = message_ids[:MCP_EXPORT_LIMIT]
 
-        # Fetch all messages (this may take a while for large date ranges)
-        all_messages = []
-        for i, msg_id in enumerate(ids_to_fetch, 1):
-            message = reports.execute_gmail_request(
-                service,
-                lambda: service.users()
-                .messages()
-                .get(userId="me", id=msg_id)
-                .execute(),
-            )
-            all_messages.append(message)
+        # Build stub messages to pass through fetch_message_details
+        stubs = [{"id": mid} for mid in ids_to_fetch]
+        all_messages = fetch_message_details(service, stubs, include_thread_id=True)
 
         summary = f"Exported {len(all_messages)} message(s) from {start_date} to {end_date}"
         if truncated:
             summary += (
-                f"\n\n⚠️  WARNING: Only {_MCP_EXPORT_LIMIT} of {len(message_ids)} total messages "
-                f"were exported. The MCP tool limits exports to {_MCP_EXPORT_LIMIT} messages. "
+                f"\n\nWARNING: Only {MCP_EXPORT_LIMIT} of {len(message_ids)} total messages "
+                f"were exported. The MCP tool limits exports to {MCP_EXPORT_LIMIT} messages. "
                 "For a complete export, use the CLI: "
                 f"gmail-reader export --start-date {start_date} --end-date {end_date} --file output.json"
             )
