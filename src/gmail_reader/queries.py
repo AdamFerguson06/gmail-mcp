@@ -57,3 +57,28 @@ def validate_date_format(date_str: str) -> str:
         return date_str
     except ValueError:
         raise ValueError(f"Invalid date format: {date_str}. Use YYYY-MM-DD.")
+
+
+def validate_date_range(start_date: str, end_date: str) -> None:
+    """Validate that start_date is not after end_date.
+
+    Catches reversed date ranges (start > end) that would silently return
+    0 results from the Gmail API with no explanation.
+
+    Args:
+        start_date: Start date string in YYYY-MM-DD format (already validated)
+        end_date: End date string in YYYY-MM-DD format (already validated)
+
+    Raises:
+        ValueError: If start_date is later than end_date
+    """
+    import datetime
+
+    start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+
+    if start > end:
+        raise ValueError(
+            f"Invalid date range: start date ({start_date}) is after end date ({end_date}). "
+            "Please provide a start date that is on or before the end date."
+        )

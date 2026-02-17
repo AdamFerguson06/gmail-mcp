@@ -15,10 +15,13 @@ from mcp.types import Tool, TextContent, Resource, ListResourcesResult
 
 from gmail_reader.client import get_gmail_service
 from gmail_reader import reports
-from gmail_reader.queries import validate_date_format
+from gmail_reader.queries import validate_date_format, validate_date_range
 
 # Initialize MCP server
 app = Server("gmail-reader")
+
+# Gmail API has ~2000 char query limit; enforce this before API call
+MAX_QUERY_LENGTH = 2000
 
 
 @app.list_tools()
@@ -193,6 +196,17 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         if not query:
             return [TextContent(type="text", text="Error: query parameter is required")]
 
+        # Enforce query length limit before hitting API
+        if len(query) > MAX_QUERY_LENGTH:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: Query is too long ({len(query)} chars). "
+                    f"Gmail API supports a maximum of {MAX_QUERY_LENGTH} characters. "
+                    "Please shorten your query.",
+                )
+            ]
+
         messages = reports._fetch_all_messages(
             service, query=query, max_results=max_results
         )
@@ -345,10 +359,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             ]
 
-        # Validate dates
+        # Validate dates and range
         try:
             validate_date_format(start_date)
             validate_date_format(end_date)
+            # Reject reversed date ranges early
+            validate_date_range(start_date, end_date)
         except ValueError as e:
             return [TextContent(type="text", text=f"Date validation error: {e}")]
 
@@ -365,9 +381,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             ]
 
+        # Warn users when result is truncated at the MCP export limit
+        _MCP_EXPORT_LIMIT = 100
+        truncated = len(message_ids) > _MCP_EXPORT_LIMIT
+        ids_to_fetch = message_ids[:_MCP_EXPORT_LIMIT]
+
         # Fetch all messages (this may take a while for large date ranges)
         all_messages = []
-        for i, msg_id in enumerate(message_ids[:100], 1):  # Limit to 100 for MCP
+        for i, msg_id in enumerate(ids_to_fetch, 1):
             message = reports.execute_gmail_request(
                 service,
                 lambda: service.users()
@@ -377,11 +398,19 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             )
             all_messages.append(message)
 
+        summary = f"Exported {len(all_messages)} message(s) from {start_date} to {end_date}"
+        if truncated:
+            summary += (
+                f"\n\n⚠️  WARNING: Only {_MCP_EXPORT_LIMIT} of {len(message_ids)} total messages "
+                f"were exported. The MCP tool limits exports to {_MCP_EXPORT_LIMIT} messages. "
+                "For a complete export, use the CLI: "
+                f"gmail-reader export --start-date {start_date} --end-date {end_date} --file output.json"
+            )
+
         return [
             TextContent(
                 type="text",
-                text=f"Exported {len(all_messages)} message(s) from {start_date} to {end_date}\n\n"
-                + json.dumps(all_messages, indent=2),
+                text=summary + "\n\n" + json.dumps(all_messages, indent=2),
             )
         ]
 

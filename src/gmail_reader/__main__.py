@@ -11,13 +11,19 @@ Commands:
 """
 
 import argparse
+import re
 import sys
 
 from gmail_reader.auth import run_oauth_flow
 from gmail_reader.client import get_gmail_service
 from gmail_reader import reports
-from gmail_reader.queries import validate_date_format
+from gmail_reader.queries import validate_date_format, validate_date_range
 
+# Gmail API has ~2000 char query limit
+MAX_QUERY_LENGTH = 2000
+
+# Gmail message/thread IDs are variable-length hex strings
+_GMAIL_ID_PATTERN = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 
 def main():
     """Main CLI entry point."""
@@ -146,6 +152,15 @@ Examples:
             if not args.query:
                 print("Error: --query is required for search command", file=sys.stderr)
                 sys.exit(1)
+            # Enforce Gmail API query length limit
+            if len(args.query) > MAX_QUERY_LENGTH:
+                print(
+                    f"Error: Query is too long ({len(args.query)} chars). "
+                    f"Gmail API supports a maximum of {MAX_QUERY_LENGTH} characters. "
+                    "Please shorten your query.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             reports.print_message_list(
                 service,
                 query=args.query,
@@ -156,6 +171,14 @@ Examples:
         elif args.command == "read":
             if not args.message_id:
                 print("Error: --message-id is required for read command", file=sys.stderr)
+                sys.exit(1)
+            # Validate Gmail message ID format (hex string) before API call
+            if not _GMAIL_ID_PATTERN.match(args.message_id):
+                print(
+                    f"Error: Invalid message ID format: '{args.message_id}'. "
+                    "Gmail message IDs are hexadecimal strings.",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             reports.print_message_detail(
                 service,
@@ -172,10 +195,12 @@ Examples:
                 )
                 sys.exit(1)
 
-            # Validate date formats
+            # Validate date formats and range
             try:
                 start_date = validate_date_format(args.start_date)
                 end_date = validate_date_format(args.end_date)
+                # Reject reversed date ranges early
+                validate_date_range(start_date, end_date)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
@@ -193,6 +218,14 @@ Examples:
         elif args.command == "threads":
             if not args.thread_id:
                 print("Error: --thread-id is required for threads command", file=sys.stderr)
+                sys.exit(1)
+            # Validate Gmail thread ID format (hex string) before API call
+            if not _GMAIL_ID_PATTERN.match(args.thread_id):
+                print(
+                    f"Error: Invalid thread ID format: '{args.thread_id}'. "
+                    "Gmail thread IDs are hexadecimal strings.",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             reports.print_thread_messages(
                 service, args.thread_id, output_format=args.output

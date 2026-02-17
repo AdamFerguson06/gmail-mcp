@@ -4,9 +4,11 @@ CRITICAL SECURITY: Only gmail.readonly scope is used.
 This prevents sending, modifying, or deleting emails.
 """
 
+import fcntl
 import sys
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -68,8 +70,15 @@ def run_oauth_flow() -> None:
     print("\nOpening browser for Google authentication...")
     print("Please grant permission for read-only Gmail access.")
 
-    # Run local server and open browser
-    creds = flow.run_local_server(port=8080)
+    # If port 8080 is in use, fall back to OS-assigned port (port=0)
+    try:
+        creds = flow.run_local_server(port=8080)
+    except OSError:
+        print(
+            "Warning: Port 8080 is in use. Falling back to OS-assigned port.",
+            file=sys.stderr,
+        )
+        creds = flow.run_local_server(port=0)
 
     # Save refresh token to ~/.env
     refresh_token = creds.refresh_token
@@ -117,7 +126,16 @@ def get_credentials() -> Credentials:
     if not creds.valid:
         if creds.refresh_token:
             # Credentials object created from refresh token needs initial refresh
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                # Provide actionable error message when refresh token is revoked
+                raise EnvironmentError(
+                    f"OAuth refresh token is invalid or has been revoked: {e}\n"
+                    "This can happen if you changed your Google password, revoked app access, "
+                    "or if the token expired.\n"
+                    "Run 'gmail-reader auth' to re-authenticate and obtain a new refresh token."
+                ) from e
         else:
             raise EnvironmentError(
                 "Credentials invalid. Run 'gmail-reader auth' to re-authenticate."
@@ -129,6 +147,9 @@ def get_credentials() -> Credentials:
 def _append_refresh_token_to_env(refresh_token: str) -> None:
     """Safely append or update GMAIL_REFRESH_TOKEN in ~/.env.
 
+    Uses fcntl.flock() exclusive lock to prevent concurrent
+    'gmail-reader auth' processes from clobbering each other's refresh token.
+
     Args:
         refresh_token: OAuth refresh token to save
 
@@ -137,23 +158,30 @@ def _append_refresh_token_to_env(refresh_token: str) -> None:
     """
     env_path = Path.home() / ".env"
 
-    if env_path.exists():
-        content = env_path.read_text()
+    # Open (or create) the .env file and acquire an exclusive lock
+    # before reading/writing to prevent race conditions with concurrent auth runs.
+    with env_path.open("a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            # Re-read content under lock to get the current state
+            lock_file.seek(0)
+            content = lock_file.read()
 
-        if "GMAIL_REFRESH_TOKEN" in content:
-            # Update existing
-            lines = content.splitlines()
-            updated = []
-            for line in lines:
-                if line.startswith("GMAIL_REFRESH_TOKEN="):
-                    updated.append(f"GMAIL_REFRESH_TOKEN={refresh_token}")
-                else:
-                    updated.append(line)
-            env_path.write_text("\n".join(updated) + "\n")
-        else:
-            # Append new
-            with env_path.open("a") as f:
-                f.write(f"\nGMAIL_REFRESH_TOKEN={refresh_token}\n")
-    else:
-        # Create new .env
-        env_path.write_text(f"GMAIL_REFRESH_TOKEN={refresh_token}\n")
+            if "GMAIL_REFRESH_TOKEN" in content:
+                # Update existing token in-place
+                lines = content.splitlines()
+                updated = []
+                for line in lines:
+                    if line.startswith("GMAIL_REFRESH_TOKEN="):
+                        updated.append(f"GMAIL_REFRESH_TOKEN={refresh_token}")
+                    else:
+                        updated.append(line)
+                new_content = "\n".join(updated) + "\n"
+                lock_file.seek(0)
+                lock_file.truncate()
+                lock_file.write(new_content)
+            else:
+                # Append new token
+                lock_file.write(f"\nGMAIL_REFRESH_TOKEN={refresh_token}\n")
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)

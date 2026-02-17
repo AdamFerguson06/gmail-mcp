@@ -1,6 +1,7 @@
 """Email parsing, formatting, and display functions."""
 
 import base64
+import binascii
 import json
 import sys
 from datetime import datetime
@@ -204,28 +205,41 @@ def export_messages_to_json(service, start_date, end_date, output_file):
 
     print(f"Exporting {len(message_ids)} messages to {output_file}...")
 
-    with open(output_file, "w") as f:
-        f.write("[\n")
-        first = True
+    # Wrap export in try/except so partial-write failures are reported
+    # clearly instead of leaving an invalid JSON file with no error message.
+    exported_count = 0
+    try:
+        with open(output_file, "w") as f:
+            f.write("[\n")
+            first = True
 
-        for i, msg_id in enumerate(message_ids, 1):
-            if i % 100 == 0:
-                print(f"Progress: {i}/{len(message_ids)} messages exported...")
+            for i, msg_id in enumerate(message_ids, 1):
+                if i % 100 == 0:
+                    print(f"Progress: {i}/{len(message_ids)} messages exported...")
 
-            message = execute_gmail_request(
-                service,
-                lambda: service.users()
-                .messages()
-                .get(userId="me", id=msg_id)
-                .execute(),
-            )
+                message = execute_gmail_request(
+                    service,
+                    lambda: service.users()
+                    .messages()
+                    .get(userId="me", id=msg_id)
+                    .execute(),
+                )
 
-            if not first:
-                f.write(",\n")
-            json.dump(message, f, indent=2)
-            first = False
+                if not first:
+                    f.write(",\n")
+                json.dump(message, f, indent=2)
+                first = False
+                exported_count += 1
 
-        f.write("\n]\n")
+            f.write("\n]\n")
+    except Exception as e:
+        print(
+            f"Error: Export failed after writing {exported_count}/{len(message_ids)} messages. "
+            f"Output file '{output_file}' may be incomplete or invalid JSON. "
+            f"Reason: {e}",
+            file=sys.stderr,
+        )
+        raise
 
     print(f"✅ Export complete: {len(message_ids)} messages saved to {output_file}")
 
@@ -243,10 +257,28 @@ def _fetch_all_messages(service, query=None, max_results=None):
     Returns:
         list of message dicts with 'id' and 'threadId'
     """
+    # Guard against infinite pagination from duplicate nextPageToken.
+    # Also enforces a hard page limit as a safety net.
+    _MAX_PAGES = 1000
+
+    # Hard memory limit to prevent 100MB+ RAM usage on large inboxes
+    _MAX_MESSAGES_IN_MEMORY = 10000
+
+    seen_tokens: set = set()
+
     all_messages = []
     page_token = None
+    page_count = 0
 
     while True:
+        if page_count >= _MAX_PAGES:
+            print(
+                f"Warning: Reached maximum page limit ({_MAX_PAGES}). "
+                "Returning partial results.",
+                file=sys.stderr,
+            )
+            break
+
         params = {
             "userId": "me",
             "maxResults": min(500, max_results or 500),  # API max per page
@@ -262,14 +294,37 @@ def _fetch_all_messages(service, query=None, max_results=None):
 
         messages = result.get("messages", [])
         all_messages.extend(messages)
+        page_count += 1
+
+        # Enforce hard memory limit
+        if len(all_messages) >= _MAX_MESSAGES_IN_MEMORY:
+            print(
+                f"Warning: Reached maximum in-memory message limit ({_MAX_MESSAGES_IN_MEMORY}). "
+                "Returning partial results to avoid excessive memory usage. "
+                "Use --start-date/--end-date to narrow the query.",
+                file=sys.stderr,
+            )
+            return all_messages[:_MAX_MESSAGES_IN_MEMORY]
 
         # Check if we've hit user's max_results limit
         if max_results and len(all_messages) >= max_results:
             return all_messages[:max_results]
 
-        page_token = result.get("nextPageToken")
-        if not page_token:
+        new_page_token = result.get("nextPageToken")
+        if not new_page_token:
             break
+
+        # Detect duplicate nextPageToken to prevent infinite loop
+        if new_page_token in seen_tokens:
+            print(
+                f"Warning: Duplicate nextPageToken detected at page {page_count}. "
+                "Stopping pagination to prevent infinite loop.",
+                file=sys.stderr,
+            )
+            break
+
+        seen_tokens.add(new_page_token)
+        page_token = new_page_token
 
     return all_messages
 
@@ -314,22 +369,36 @@ def _parse_headers(payload) -> dict:
     return headers
 
 
-def _parse_body(payload) -> tuple[str, str]:
+# Limit recursive MIME parsing depth to prevent stack overflow on deeply nested messages
+_MAX_MIME_DEPTH = 50
+
+
+def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
     """Extract text and HTML body from message payload.
 
     Handles:
     - Simple body (non-multipart)
     - Multipart messages (text/plain + text/html)
-    - Nested multipart
+    - Nested multipart (up to MAX_MIME_DEPTH levels)
     - Base64 decoding (Gmail uses urlsafe_b64decode)
-    - Encoding errors (return "(parsing error)")
+    - Encoding errors (try multiple encodings before replace)
 
     Args:
         payload: Gmail message payload dict
+        depth: Current recursion depth (used to enforce MAX_MIME_DEPTH)
 
     Returns:
         tuple of (text_body, html_body)
     """
+    # Guard against deeply nested multipart messages
+    if depth > _MAX_MIME_DEPTH:
+        print(
+            f"Warning: MIME parsing exceeded maximum depth ({_MAX_MIME_DEPTH}). "
+            "Skipping remaining nested parts.",
+            file=sys.stderr,
+        )
+        return "", ""
+
     text_body = ""
     html_body = ""
 
@@ -340,9 +409,9 @@ def _parse_body(payload) -> tuple[str, str]:
             mime_type = payload.get("mimeType", "text/plain")
 
             if "html" in mime_type.lower():
-                html_body = data.decode("utf-8", errors="replace")
+                html_body = _decode_bytes(data)
             else:
-                text_body = data.decode("utf-8", errors="replace")
+                text_body = _decode_bytes(data)
 
             return text_body, html_body
 
@@ -353,23 +422,46 @@ def _parse_body(payload) -> tuple[str, str]:
 
             if mime_type == "text/plain" and "data" in part.get("body", {}):
                 data = base64.urlsafe_b64decode(part["body"]["data"])
-                text_body = data.decode("utf-8", errors="replace")
+                text_body = _decode_bytes(data)
 
             elif mime_type == "text/html" and "data" in part.get("body", {}):
                 data = base64.urlsafe_b64decode(part["body"]["data"])
-                html_body = data.decode("utf-8", errors="replace")
+                html_body = _decode_bytes(data)
 
             elif "parts" in part:
-                # Nested multipart
-                nested_text, nested_html = _parse_body(part)
+                # Nested multipart — pass incremented depth
+                nested_text, nested_html = _parse_body(part, depth=depth + 1)
                 text_body = text_body or nested_text
                 html_body = html_body or nested_html
 
-    except (KeyError, ValueError, UnicodeDecodeError) as e:
+    except (KeyError, ValueError, UnicodeDecodeError, binascii.Error) as e:
         print(f"Warning: Failed to parse message body: {e}", file=sys.stderr)
         return "(parsing error)", "(parsing error)"
 
     return text_body, html_body
+
+
+def _decode_bytes(data: bytes) -> str:
+    """Decode email body bytes, trying common encodings before falling back.
+
+    Try multiple encodings (utf-8, windows-1252, iso-8859-1) before falling
+    back to errors='replace', to avoid garbling cp1252 emails. Note:
+    windows-1252 must come before iso-8859-1 because iso-8859-1 accepts
+    every byte sequence without error, making any later fallback unreachable.
+
+    Args:
+        data: Raw bytes from email body
+
+    Returns:
+        Decoded string
+    """
+    for encoding in ("utf-8", "windows-1252", "iso-8859-1"):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # Last resort: replace undecodable bytes
+    return data.decode("utf-8", errors="replace")
 
 
 def _format_date(internal_date: str) -> str:
