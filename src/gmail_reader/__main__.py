@@ -8,22 +8,25 @@ Commands:
     export      - Export emails to JSON file
     labels      - List all Gmail labels
     threads     - View all messages in a thread
+    test        - Verify credentials and API connectivity
 """
 
 import argparse
-import re
+import logging
 import sys
 
+from googleapiclient.errors import HttpError
+
 from gmail_reader.auth import run_oauth_flow
-from gmail_reader.client import get_gmail_service
+from gmail_reader.client import get_gmail_service, execute_gmail_request
 from gmail_reader import reports
-from gmail_reader.queries import validate_date_format, validate_date_range
+from gmail_reader.queries import (
+    validate_date_format,
+    validate_date_range,
+    validate_gmail_id,
+    validate_query_length,
+)
 
-# Gmail API has ~2000 char query limit
-MAX_QUERY_LENGTH = 2000
-
-# Gmail message/thread IDs are variable-length hex strings
-_GMAIL_ID_PATTERN = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 
 def main():
     """Main CLI entry point."""
@@ -34,6 +37,9 @@ def main():
 Examples:
   # One-time setup
   gmail-reader auth
+
+  # Verify credentials work
+  gmail-reader test
 
   # List 50 most recent emails
   gmail-reader list
@@ -66,7 +72,7 @@ Examples:
 
     parser.add_argument(
         "command",
-        choices=["auth", "list", "search", "read", "export", "labels", "threads"],
+        choices=["auth", "list", "search", "read", "export", "labels", "threads", "test"],
         help="Command to execute",
     )
 
@@ -124,7 +130,18 @@ Examples:
         help="Output file path (for export command with --output json)",
     )
 
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose/debug logging",
+    )
+
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+    )
 
     # Handle auth command separately (doesn't require service)
     if args.command == "auth":
@@ -143,7 +160,17 @@ Examples:
 
     # Command dispatch
     try:
-        if args.command == "list":
+        if args.command == "test":
+            profile = execute_gmail_request(
+                service,
+                lambda: service.users().getProfile(userId="me").execute(),
+                operation_name="getProfile",
+            )
+            print(f"Authenticated as: {profile.get('emailAddress', '(unknown)')}")
+            print(f"Total messages: {profile.get('messagesTotal', '(unknown)')}")
+            print(f"Total threads: {profile.get('threadsTotal', '(unknown)')}")
+
+        elif args.command == "list":
             reports.print_message_list(
                 service, max_results=args.max, output_format=args.output
             )
@@ -152,14 +179,10 @@ Examples:
             if not args.query:
                 print("Error: --query is required for search command", file=sys.stderr)
                 sys.exit(1)
-            # Enforce Gmail API query length limit
-            if len(args.query) > MAX_QUERY_LENGTH:
-                print(
-                    f"Error: Query is too long ({len(args.query)} chars). "
-                    f"Gmail API supports a maximum of {MAX_QUERY_LENGTH} characters. "
-                    "Please shorten your query.",
-                    file=sys.stderr,
-                )
+            try:
+                validate_query_length(args.query)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
             reports.print_message_list(
                 service,
@@ -172,13 +195,10 @@ Examples:
             if not args.message_id:
                 print("Error: --message-id is required for read command", file=sys.stderr)
                 sys.exit(1)
-            # Validate Gmail message ID format (hex string) before API call
-            if not _GMAIL_ID_PATTERN.match(args.message_id):
-                print(
-                    f"Error: Invalid message ID format: '{args.message_id}'. "
-                    "Gmail message IDs are hexadecimal strings.",
-                    file=sys.stderr,
-                )
+            try:
+                validate_gmail_id(args.message_id, label="message ID")
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
             reports.print_message_detail(
                 service,
@@ -195,17 +215,14 @@ Examples:
                 )
                 sys.exit(1)
 
-            # Validate date formats and range
             try:
                 start_date = validate_date_format(args.start_date)
                 end_date = validate_date_format(args.end_date)
-                # Reject reversed date ranges early
                 validate_date_range(start_date, end_date)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
 
-            # Determine output file
             output_file = args.file or f"gmail_export_{start_date}_to_{end_date}.json"
 
             reports.export_messages_to_json(
@@ -219,13 +236,10 @@ Examples:
             if not args.thread_id:
                 print("Error: --thread-id is required for threads command", file=sys.stderr)
                 sys.exit(1)
-            # Validate Gmail thread ID format (hex string) before API call
-            if not _GMAIL_ID_PATTERN.match(args.thread_id):
-                print(
-                    f"Error: Invalid thread ID format: '{args.thread_id}'. "
-                    "Gmail thread IDs are hexadecimal strings.",
-                    file=sys.stderr,
-                )
+            try:
+                validate_gmail_id(args.thread_id, label="thread ID")
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
             reports.print_thread_messages(
                 service, args.thread_id, output_format=args.output
@@ -234,8 +248,14 @@ Examples:
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.", file=sys.stderr)
         sys.exit(1)
+    except HttpError as e:
+        print(f"Gmail API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except EnvironmentError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
