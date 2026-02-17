@@ -444,8 +444,10 @@ def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
 def _decode_bytes(data: bytes) -> str:
     """Decode email body bytes, trying common encodings before falling back.
 
-    Try multiple encodings (utf-8, iso-8859-1, windows-1252) before falling
-    back to errors='replace', to avoid garbling ISO-8859-1 emails.
+    Try multiple encodings (utf-8, windows-1252, iso-8859-1) before falling
+    back to errors='replace', to avoid garbling cp1252 emails. Note:
+    windows-1252 must come before iso-8859-1 because iso-8859-1 accepts
+    every byte sequence without error, making any later fallback unreachable.
 
     Args:
         data: Raw bytes from email body
@@ -453,7 +455,7 @@ def _decode_bytes(data: bytes) -> str:
     Returns:
         Decoded string
     """
-    for encoding in ("utf-8", "iso-8859-1", "windows-1252"):
+    for encoding in ("utf-8", "windows-1252", "iso-8859-1"):
         try:
             return data.decode(encoding)
         except (UnicodeDecodeError, LookupError):

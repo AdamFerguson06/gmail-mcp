@@ -22,9 +22,8 @@ from gmail_reader.queries import validate_date_format, validate_date_range
 # Gmail API has ~2000 char query limit
 MAX_QUERY_LENGTH = 2000
 
-# Gmail message/thread IDs are 16-char hex strings
-_GMAIL_ID_PATTERN = re.compile(r'^[0-9a-f]{16}$', re.IGNORECASE)
-
+# Gmail message/thread IDs are variable-length hex strings
+_GMAIL_ID_PATTERN = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 
 def main():
     """Main CLI entry point."""
@@ -173,11 +172,11 @@ Examples:
             if not args.message_id:
                 print("Error: --message-id is required for read command", file=sys.stderr)
                 sys.exit(1)
-            # Validate Gmail message ID format (16-char hex) before API call
+            # Validate Gmail message ID format (hex string) before API call
             if not _GMAIL_ID_PATTERN.match(args.message_id):
                 print(
                     f"Error: Invalid message ID format: '{args.message_id}'. "
-                    "Gmail message IDs are 16-character hexadecimal strings.",
+                    "Gmail message IDs are hexadecimal strings.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -220,11 +219,11 @@ Examples:
             if not args.thread_id:
                 print("Error: --thread-id is required for threads command", file=sys.stderr)
                 sys.exit(1)
-            # Validate Gmail thread ID format (16-char hex) before API call
+            # Validate Gmail thread ID format (hex string) before API call
             if not _GMAIL_ID_PATTERN.match(args.thread_id):
                 print(
                     f"Error: Invalid thread ID format: '{args.thread_id}'. "
-                    "Gmail thread IDs are 16-character hexadecimal strings.",
+                    "Gmail thread IDs are hexadecimal strings.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
