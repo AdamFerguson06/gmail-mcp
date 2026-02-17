@@ -1,6 +1,6 @@
-"""Gmail API client with rate limiting."""
+"""Gmail API client with rate limiting and retry logic."""
 
-import sys
+import logging
 import threading
 import time
 
@@ -8,21 +8,50 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from gmail_reader.auth import get_credentials
+from gmail_reader.config import (
+    GMAIL_MAX_RETRIES,
+    GMAIL_RATE_LIMIT_RPS,
+    GMAIL_RETRY_BASE_WAIT,
+)
 
-# Gmail API quota: 250 units/user/second
-# List operation: 5 units, Get operation: 5 units
-# Conservative default: 10 requests/sec (50 units/sec, 20% of limit)
-# This can be tuned up to ~40 req/sec if needed
-_RATE_LIMIT_RPS = 10
-_MIN_REQUEST_INTERVAL = 1.0 / _RATE_LIMIT_RPS  # 0.1 seconds
+logger = logging.getLogger(__name__)
 
-# Thread-safe rate limiting using a lock
-_last_request_time = 0.0
-_rate_limit_lock = threading.Lock()
+# HTTP status codes that are safe to retry (transient server errors)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
-# Exponential backoff settings for 429 retry
-_MAX_RETRIES = 3
-_RETRY_BASE_WAIT = 10  # seconds (10, 20, 40)
+
+class TokenBucketRateLimiter:
+    """Token bucket rate limiter that allows short bursts while enforcing average rate.
+
+    Unlike a fixed-interval limiter, this accumulates tokens over idle periods
+    (up to `capacity`), allowing burst requests after quiet periods while still
+    throttling sustained high-rate usage.
+    """
+
+    def __init__(self, rate: float, capacity: float | None = None):
+        self.rate = rate
+        self.capacity = capacity or rate
+        self.tokens = self.capacity
+        self.last_update = time.time()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block until a token is available, then consume it."""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_update
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.last_update = now
+
+            if self.tokens < 1.0:
+                sleep_time = (1.0 - self.tokens) / self.rate
+                time.sleep(sleep_time)
+                self.tokens = 0.0
+            else:
+                self.tokens -= 1.0
+
+
+_rate_limiter = TokenBucketRateLimiter(rate=GMAIL_RATE_LIMIT_RPS)
 
 
 def get_gmail_service():
@@ -35,65 +64,71 @@ def get_gmail_service():
         EnvironmentError: If credentials are missing or invalid
     """
     creds = get_credentials()
-    return build("gmail", "v1", credentials=creds)
+    try:
+        return build("gmail", "v1", credentials=creds)
+    except Exception as e:
+        raise EnvironmentError(
+            f"Failed to initialize Gmail API client: {e}\n"
+            "Check your network connection and credentials."
+        ) from e
 
 
-def execute_gmail_request(service, request_callable):
-    """Execute Gmail API request with rate limiting.
+def execute_gmail_request(service, request_callable, operation_name: str = ""):
+    """Execute Gmail API request with rate limiting and retry.
 
-    Includes thread-safe rate limiting (10 req/sec by default) and automatic
-    retry with exponential backoff on 429 (rate limit exceeded) errors.
+    Includes token-bucket rate limiting and automatic retry with exponential
+    backoff on transient errors (429, 500, 502, 503).
 
     Args:
-        service: Gmail API service object (not used, kept for consistency)
-        request_callable: Lambda that returns API request
-                         e.g., lambda: service.users().messages().list(...).execute()
+        service: Gmail API service object (kept for call-site consistency)
+        request_callable: Callable that executes the API request,
+            e.g., lambda: service.users().messages().list(...).execute()
+        operation_name: Optional label for log messages (e.g. "list messages")
 
     Returns:
         dict: API response
 
     Raises:
-        HttpError: For non-429 HTTP errors, or 429 after max retries exceeded
+        HttpError: For non-retryable HTTP errors, or after max retries exceeded
     """
-    global _last_request_time
+    _rate_limiter.acquire()
 
-    # Thread-safe rate limiting: acquire lock to prevent concurrent calls
-    # from bursting past the rate limit.
-    with _rate_limit_lock:
-        elapsed = time.time() - _last_request_time
-        if elapsed < _MIN_REQUEST_INTERVAL:
-            time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
-        _last_request_time = time.time()
+    label = f" [{operation_name}]" if operation_name else ""
+    last_error: HttpError | None = None
 
-    # Exponential backoff retry for 429 errors
-    last_error = None
-    for attempt in range(_MAX_RETRIES + 1):
+    for attempt in range(GMAIL_MAX_RETRIES + 1):
         try:
             return request_callable()
         except HttpError as error:
-            if error.resp.status == 429:
-                if attempt < _MAX_RETRIES:
-                    wait_time = _RETRY_BASE_WAIT * (2 ** attempt)  # 10, 20, 40 seconds
-                    print(
-                        f"Rate limit exceeded, waiting {wait_time}s before retry "
-                        f"(attempt {attempt + 1}/{_MAX_RETRIES})...",
-                        file=sys.stderr,
-                    )
-                    time.sleep(wait_time)
-                    last_error = error
+            status = error.resp.status
+            if status in _RETRYABLE_STATUS_CODES and attempt < GMAIL_MAX_RETRIES:
+                # Honor Retry-After header if present, otherwise exponential backoff
+                retry_after = error.resp.get("retry-after")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                    except (ValueError, TypeError):
+                        wait_time = GMAIL_RETRY_BASE_WAIT * (2 ** attempt)
                 else:
-                    print(
-                        f"Rate limit exceeded after {_MAX_RETRIES} retries. Giving up.",
-                        file=sys.stderr,
-                    )
-                    raise
-            else:
-                # Other HTTP errors - re-raise immediately
-                print(
-                    f"Gmail API error: {error.error_details if hasattr(error, 'error_details') else error}",
-                    file=sys.stderr,
+                    wait_time = GMAIL_RETRY_BASE_WAIT * (2 ** attempt)
+
+                logger.warning(
+                    "HTTP %d%s, retrying in %.1fs (attempt %d/%d)",
+                    status, label, wait_time, attempt + 1, GMAIL_MAX_RETRIES,
+                )
+                time.sleep(wait_time)
+                last_error = error
+            elif status in _RETRYABLE_STATUS_CODES:
+                logger.error(
+                    "HTTP %d%s after %d retries, giving up",
+                    status, label, GMAIL_MAX_RETRIES,
                 )
                 raise
+            else:
+                logger.error("Gmail API error%s: %s", label, error)
+                raise
 
-    # Should not reach here, but re-raise last error as a safety net
-    raise last_error  # type: ignore[misc]
+    # Safety net: should not reach here, but re-raise last error if we do
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unexpected retry loop exit{label}")
