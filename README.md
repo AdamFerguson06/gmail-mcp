@@ -2,7 +2,16 @@
 
 **CRITICAL SECURITY NOTICE: This tool is READ-ONLY ONLY. It cannot send, modify, or delete emails.**
 
-A secure, Python-based CLI tool for investigating Gmail accounts with guaranteed read-only access. Uses the same battle-tested security architecture as [google_ads_controller](https://github.com/AdamFerguson06/google-ads-controller).
+A secure, Python-based CLI tool **and MCP server** for investigating Gmail accounts with guaranteed read-only access. Provides seamless Gmail integration for Claude desktop/Code via Model Context Protocol (MCP). Uses the same battle-tested security architecture as [google_ads_controller](https://github.com/AdamFerguson06/google-ads-controller).
+
+## Features
+
+- **Dual Interface**: CLI tool + MCP server for Claude integration
+- **Read-Only**: Gmail API with `gmail.readonly` scope only
+- **Secure**: Test-enforced security guardrails (13 tests, all passing)
+- **Full Access**: Search, read, list, export emails and threads
+- **Rate Limited**: 10 req/sec (configurable Gmail API quota management)
+- **OAuth 2.0**: Secure authentication with credentials in `~/.env`
 
 ## Security Guarantees
 
@@ -39,7 +48,7 @@ A secure, Python-based CLI tool for investigating Gmail accounts with guaranteed
 
 ### Prerequisites
 
-- Python 3.9+
+- Python 3.9+ (CLI only) or Python 3.11+ (for MCP server)
 - Google Cloud Project with Gmail API enabled
 - OAuth 2.0 credentials (Desktop app)
 
@@ -90,6 +99,91 @@ A secure, Python-based CLI tool for investigating Gmail accounts with guaranteed
    ```bash
    gmail-reader list --max 10
    ```
+
+## MCP Server Setup (Claude Integration)
+
+The MCP server allows Claude to directly access your Gmail without manual CLI commands.
+
+### Quick Setup
+
+1. **Ensure Python 3.11+ is installed** (MCP requires Python 3.10+):
+   ```bash
+   python3.11 --version  # Should be 3.11 or higher
+   ```
+
+2. **Install gmail-reader** (if not already):
+   ```bash
+   cd ~/Documents/gmail_reader
+   python3.11 -m venv .venv
+   source .venv/bin/activate
+   pip install -e .
+   ```
+
+3. **Configure MCP server** in Claude desktop config:
+
+   For **Claude Code** (VSCode extension), add to your MCP settings:
+   ```json
+   {
+     "mcpServers": {
+       "gmail": {
+         "command": "/Users/YOUR_USERNAME/Documents/gmail_reader/.venv/bin/python",
+         "args": ["-m", "gmail_reader.mcp_server"],
+         "env": {}
+       }
+     }
+   }
+   ```
+
+   For **Claude Desktop app**, add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+   ```json
+   {
+     "mcpServers": {
+       "gmail": {
+         "command": "/Users/YOUR_USERNAME/Documents/gmail_reader/.venv/bin/python",
+         "args": ["-m", "gmail_reader.mcp_server"]
+       }
+     }
+   }
+   ```
+
+4. **Restart Claude** to load the MCP server
+
+### MCP Tools Available
+
+Once configured, Claude can use these tools:
+
+| Tool | Description |
+|------|-------------|
+| `gmail_list` | List recent emails with sender, subject, date, snippet |
+| `gmail_search` | Search with Gmail query operators (from:, subject:, after:, etc.) |
+| `gmail_read` | Read full email content (headers + body) |
+| `gmail_labels` | List all Gmail labels (INBOX, SENT, user-created) |
+| `gmail_thread` | View all messages in a thread/conversation |
+| `gmail_export` | Export emails in date range to JSON |
+
+### Example Claude Interactions
+
+```
+User: "Show me emails from boss@company.com in the last week"
+Claude: [Uses gmail_search with query "from:boss@company.com after:2026/02/10"]
+
+User: "Read the most recent email from Google"
+Claude: [Uses gmail_list to find ID, then gmail_read to show full content]
+
+User: "How many unread emails do I have?"
+Claude: [Uses gmail_search with query "is:unread"]
+```
+
+### Troubleshooting MCP Server
+
+**Error: "Authentication error"**
+- Run `gmail-reader auth` in terminal first
+- Ensure `~/.env` has `GMAIL_REFRESH_TOKEN`
+
+**MCP server not loading**
+- Check Python path is correct (use absolute path)
+- Restart Claude desktop/Code
+- Check Claude logs for errors
 
 ## Usage
 
@@ -217,6 +311,7 @@ gmail_reader/
 │   ├── client.py            - Gmail API client + rate limiting
 │   ├── queries.py           - Query constants & helpers
 │   ├── __main__.py          - CLI entry point
+│   ├── mcp_server.py        - MCP server for Claude integration
 │   └── reports.py           - Email parsing & formatting
 ├── tests/
 │   ├── test_config.py                - Config loading tests
