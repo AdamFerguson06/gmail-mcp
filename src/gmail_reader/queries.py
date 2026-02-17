@@ -1,5 +1,12 @@
 """Gmail API query constants and helper functions."""
 
+import re
+
+from gmail_reader.config import MAX_QUERY_LENGTH
+
+# Gmail message/thread IDs are variable-length hex strings
+_GMAIL_ID_PATTERN = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
+
 # Message fields to request (partial response optimization)
 # Reduces bandwidth and improves performance
 MESSAGE_LIST_FIELDS = "messages(id,threadId,labelIds,snippet,internalDate)"
@@ -81,4 +88,39 @@ def validate_date_range(start_date: str, end_date: str) -> None:
         raise ValueError(
             f"Invalid date range: start date ({start_date}) is after end date ({end_date}). "
             "Please provide a start date that is on or before the end date."
+        )
+
+
+def validate_query_length(query: str) -> None:
+    """Validate that a Gmail search query does not exceed the API limit.
+
+    Args:
+        query: Gmail search query string
+
+    Raises:
+        ValueError: If query exceeds MAX_QUERY_LENGTH characters
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        raise ValueError(
+            f"Query too long ({len(query)} chars). "
+            f"Maximum is {MAX_QUERY_LENGTH} characters."
+        )
+
+
+def validate_gmail_id(value: str, label: str = "ID") -> None:
+    """Validate that a string looks like a Gmail message or thread ID.
+
+    Gmail IDs are variable-length hexadecimal strings.
+
+    Args:
+        value: The ID string to validate
+        label: Human-readable label for error messages (e.g. "message ID", "thread ID")
+
+    Raises:
+        ValueError: If value is not a valid hex string
+    """
+    if not _GMAIL_ID_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid {label} format: '{value}'. "
+            f"Gmail {label}s are hexadecimal strings."
         )
