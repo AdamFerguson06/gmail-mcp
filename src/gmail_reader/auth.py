@@ -2,9 +2,13 @@
 
 CRITICAL SECURITY: Only gmail.readonly scope is used.
 This prevents sending, modifying, or deleting emails.
+
+Note: Uses fcntl for file locking, which is POSIX-only (Linux, macOS).
+Windows is not currently supported.
 """
 
 import fcntl
+import logging
 import sys
 from pathlib import Path
 
@@ -14,6 +18,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from gmail_reader.config import load_config
+
+logger = logging.getLogger(__name__)
 
 # CRITICAL: Read-only scope ONLY. Never add gmail.send, gmail.modify, etc.
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -74,10 +80,7 @@ def run_oauth_flow() -> None:
     try:
         creds = flow.run_local_server(port=8080)
     except OSError:
-        print(
-            "Warning: Port 8080 is in use. Falling back to OS-assigned port.",
-            file=sys.stderr,
-        )
+        logger.warning("Port 8080 is in use. Falling back to OS-assigned port.")
         creds = flow.run_local_server(port=0)
 
     # Save refresh token to ~/.env
@@ -128,6 +131,7 @@ def get_credentials() -> Credentials:
             # Credentials object created from refresh token needs initial refresh
             try:
                 creds.refresh(Request())
+                logger.info("Refreshed access token")
             except RefreshError as e:
                 # Provide actionable error message when refresh token is revoked
                 raise EnvironmentError(
