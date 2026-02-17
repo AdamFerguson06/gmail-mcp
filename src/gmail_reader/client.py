@@ -46,7 +46,7 @@ class TokenBucketRateLimiter:
 
             if self.tokens < 1.0:
                 sleep_time = (1.0 - self.tokens) / self.rate
-                self.tokens = 0.0
+                self.tokens -= 1.0
             else:
                 self.tokens -= 1.0
 

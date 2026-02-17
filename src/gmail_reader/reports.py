@@ -24,7 +24,6 @@ from gmail_reader.queries import (
     LABEL_FIELDS,
     MESSAGE_DETAIL_FIELDS,
     MESSAGE_FULL_FIELDS,
-    MESSAGE_LIST_FIELDS,
     THREAD_FIELDS,
     build_date_query,
 )
@@ -331,14 +330,7 @@ def export_messages_to_json(service, start_date, end_date, output_file):
                     logger.info("Export progress: %d/%d messages", i, len(message_ids))
 
                 try:
-                    message = execute_gmail_request(
-                        service,
-                        lambda mid=msg_id: service.users()
-                        .messages()
-                        .get(userId="me", id=mid, fields=MESSAGE_FULL_FIELDS)
-                        .execute(),
-                        operation_name="export message",
-                    )
+                    message = fetch_message_full_detail(service, msg_id)
                 except HttpError as e:
                     logger.warning("Skipping message %s during export: %s", msg_id, e)
                     skipped_count += 1
