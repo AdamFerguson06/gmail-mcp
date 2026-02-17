@@ -73,13 +73,13 @@ def fetch_message_details(
             logger.warning("Skipping message %s: %s", msg_id, e)
             continue
 
-        headers = _parse_headers(detail.get("payload", {}))
+        headers = parse_headers(detail.get("payload", {}))
         internal_date = detail.get("internalDate", "0")
         snippet = detail.get("snippet", "")
 
         entry = {
             "id": msg_id,
-            "date": _format_date(internal_date),
+            "date": format_date(internal_date),
             "from": headers.get("From", "(unknown)"),
             "to": headers.get("To", "(unknown)"),
             "subject": headers.get("Subject", "(no subject)"),
@@ -168,7 +168,7 @@ def print_message_list(
         max_results: Maximum number of messages to return
         output_format: "table" or "json"
     """
-    messages = _fetch_all_messages(service, query=query, max_results=max_results)
+    messages = fetch_all_messages(service, query=query, max_results=max_results)
 
     if not messages:
         print("No messages found.")
@@ -213,14 +213,14 @@ def print_message_detail(
         print(json.dumps(message, indent=2))
         return
 
-    headers = _parse_headers(message.get("payload", {}))
+    headers = parse_headers(message.get("payload", {}))
     snippet = message.get("snippet", "")
     internal_date = message.get("internalDate", "0")
     labels = message.get("labelIds", [])
 
     print("=" * 80)
     print(f"Message ID: {message_id}")
-    print(f"Date: {_format_date(internal_date)}")
+    print(f"Date: {format_date(internal_date)}")
     print(f"From: {headers.get('From', '(unknown)')}")
     print(f"To: {headers.get('To', '(unknown)')}")
     print(f"Subject: {headers.get('Subject', '(no subject)')}")
@@ -230,7 +230,7 @@ def print_message_detail(
     if detail_level == "snippet":
         print(f"\n{snippet}\n")
     else:
-        text_body, html_body = _parse_body(message.get("payload", {}))
+        text_body, html_body = parse_body(message.get("payload", {}))
 
         if text_body:
             print("\n--- Plain Text Body ---")
@@ -267,13 +267,13 @@ def print_thread_messages(service, thread_id, output_format="table"):
     print(f"Messages: {len(messages)}\n")
 
     for i, msg in enumerate(messages, 1):
-        headers = _parse_headers(msg.get("payload", {}))
+        headers = parse_headers(msg.get("payload", {}))
         snippet = msg.get("snippet", "")
         internal_date = msg.get("internalDate", "0")
 
         print(f"--- Message {i}/{len(messages)} ---")
         print(f"ID: {msg['id']}")
-        print(f"Date: {_format_date(internal_date)}")
+        print(f"Date: {format_date(internal_date)}")
         print(f"From: {headers.get('From', '(unknown)')}")
         print(f"Subject: {headers.get('Subject', '(no subject)')}")
         print(f"Snippet: {snippet[:SNIPPET_MAX_LENGTH]}")
@@ -314,7 +314,7 @@ def export_messages_to_json(service, start_date, end_date, output_file):
         output_file: Path to output JSON file
     """
     query = build_date_query(start_date, end_date)
-    message_ids = _fetch_all_message_ids(service, query=query)
+    message_ids = fetch_all_message_ids(service, query=query)
 
     print(f"Exporting {len(message_ids)} messages to {output_file}...")
 
@@ -358,11 +358,11 @@ def export_messages_to_json(service, start_date, end_date, output_file):
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Shared helpers (used by both CLI and MCP server)
 # ---------------------------------------------------------------------------
 
 
-def _fetch_all_messages(service, query=None, max_results=None):
+def fetch_all_messages(service, query=None, max_results=None):
     """Fetch all messages matching query, handling pagination.
 
     Gmail API returns nextPageToken for results > 500.
@@ -442,7 +442,7 @@ def _fetch_all_messages(service, query=None, max_results=None):
     return all_messages
 
 
-def _fetch_all_message_ids(service, query=None):
+def fetch_all_message_ids(service, query=None):
     """Fetch all message IDs matching query (for export).
 
     Args:
@@ -452,11 +452,11 @@ def _fetch_all_message_ids(service, query=None):
     Returns:
         list of message IDs (strings)
     """
-    messages = _fetch_all_messages(service, query=query)
+    messages = fetch_all_messages(service, query=query)
     return [msg["id"] for msg in messages]
 
 
-def _parse_headers(payload: dict) -> dict:
+def parse_headers(payload: dict) -> dict:
     """Extract common headers from message payload.
 
     Args:
@@ -482,7 +482,7 @@ def _parse_headers(payload: dict) -> dict:
     return headers
 
 
-def _parse_body(payload: dict, depth: int = 0) -> tuple[str, str]:
+def parse_body(payload: dict, depth: int = 0) -> tuple[str, str]:
     """Extract text and HTML body from message payload.
 
     Handles:
@@ -534,7 +534,7 @@ def _parse_body(payload: dict, depth: int = 0) -> tuple[str, str]:
                 html_body = _decode_bytes(data)
 
             elif "parts" in part:
-                nested_text, nested_html = _parse_body(part, depth=depth + 1)
+                nested_text, nested_html = parse_body(part, depth=depth + 1)
                 text_body = text_body or nested_text
                 html_body = html_body or nested_html
 
@@ -570,7 +570,7 @@ def _decode_bytes(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _format_date(internal_date: str) -> str:
+def format_date(internal_date: str) -> str:
     """Convert Gmail internalDate (ms timestamp) to YYYY-MM-DD HH:MM:SS.
 
     Args:

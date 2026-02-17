@@ -24,11 +24,11 @@ from gmail_reader.queries import (
     validate_query_length,
 )
 from gmail_reader.reports import (
-    _fetch_all_message_ids,
-    _fetch_all_messages,
-    _parse_body,
-    _parse_headers,
-    _format_date,
+    fetch_all_message_ids,
+    fetch_all_messages,
+    parse_body,
+    parse_headers,
+    format_date,
     fetch_labels,
     fetch_message_details,
     fetch_message_full_detail,
@@ -184,7 +184,7 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
 
     if name == "gmail_list":
         max_results = arguments.get("max_results", 50)
-        messages = _fetch_all_messages(service, max_results=max_results)
+        messages = fetch_all_messages(service, max_results=max_results)
 
         if not messages:
             return [TextContent(type="text", text="No messages found.")]
@@ -209,7 +209,7 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
         except ValueError as e:
             return [TextContent(type="text", text=f"Error: {e}")]
 
-        messages = _fetch_all_messages(
+        messages = fetch_all_messages(
             service, query=query, max_results=max_results
         )
 
@@ -246,14 +246,14 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
 
         message = fetch_message_full_detail(service, message_id)
 
-        headers = _parse_headers(message.get("payload", {}))
+        headers = parse_headers(message.get("payload", {}))
         snippet = message.get("snippet", "")
         internal_date = message.get("internalDate", "0")
         labels = message.get("labelIds", [])
 
         result = {
             "id": message_id,
-            "date": _format_date(internal_date),
+            "date": format_date(internal_date),
             "from": headers.get("From", "(unknown)"),
             "to": headers.get("To", "(unknown)"),
             "subject": headers.get("Subject", "(no subject)"),
@@ -262,7 +262,7 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
         }
 
         if detail_level == "full":
-            text_body, html_body = _parse_body(message.get("payload", {}))
+            text_body, html_body = parse_body(message.get("payload", {}))
             result["text_body"] = text_body
             result["html_body"] = html_body
 
@@ -297,14 +297,14 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
 
         thread_data = []
         for msg in messages:
-            headers = _parse_headers(msg.get("payload", {}))
+            headers = parse_headers(msg.get("payload", {}))
             snippet = msg.get("snippet", "")
             internal_date = msg.get("internalDate", "0")
 
             thread_data.append(
                 {
                     "id": msg["id"],
-                    "date": _format_date(internal_date),
+                    "date": format_date(internal_date),
                     "from": headers.get("From", "(unknown)"),
                     "subject": headers.get("Subject", "(no subject)"),
                     "snippet": snippet,
@@ -339,7 +339,7 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
             return [TextContent(type="text", text=f"Date validation error: {e}")]
 
         query = build_date_query(start_date, end_date)
-        message_ids = _fetch_all_message_ids(service, query=query)
+        message_ids = fetch_all_message_ids(service, query=query)
 
         if not message_ids:
             return [
@@ -356,14 +356,14 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
         for msg_id in ids_to_fetch:
             try:
                 message = fetch_message_full_detail(service, msg_id)
-                headers = _parse_headers(message.get("payload", {}))
+                headers = parse_headers(message.get("payload", {}))
                 internal_date = message.get("internalDate", "0")
-                text_body, html_body = _parse_body(message.get("payload", {}))
+                text_body, html_body = parse_body(message.get("payload", {}))
 
                 all_messages.append({
                     "id": msg_id,
                     "thread_id": message.get("threadId", ""),
-                    "date": _format_date(internal_date),
+                    "date": format_date(internal_date),
                     "from": headers.get("From", "(unknown)"),
                     "to": headers.get("To", "(unknown)"),
                     "subject": headers.get("Subject", "(no subject)"),
