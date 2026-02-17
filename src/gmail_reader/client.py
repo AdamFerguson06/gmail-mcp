@@ -37,6 +37,7 @@ class TokenBucketRateLimiter:
 
     def acquire(self) -> None:
         """Block until a token is available, then consume it."""
+        sleep_time = 0.0
         with self.lock:
             now = time.time()
             elapsed = now - self.last_update
@@ -45,10 +46,12 @@ class TokenBucketRateLimiter:
 
             if self.tokens < 1.0:
                 sleep_time = (1.0 - self.tokens) / self.rate
-                time.sleep(sleep_time)
                 self.tokens = 0.0
             else:
                 self.tokens -= 1.0
+
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 
 _rate_limiter = TokenBucketRateLimiter(rate=GMAIL_RATE_LIMIT_RPS)

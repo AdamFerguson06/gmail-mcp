@@ -352,9 +352,28 @@ async def _dispatch_tool(name: str, arguments: Any, service) -> list[TextContent
         truncated = len(message_ids) > MCP_EXPORT_LIMIT
         ids_to_fetch = message_ids[:MCP_EXPORT_LIMIT]
 
-        # Build stub messages to pass through fetch_message_details
-        stubs = [{"id": mid} for mid in ids_to_fetch]
-        all_messages = fetch_message_details(service, stubs, include_thread_id=True)
+        all_messages = []
+        for msg_id in ids_to_fetch:
+            try:
+                message = fetch_message_full_detail(service, msg_id)
+                headers = _parse_headers(message.get("payload", {}))
+                internal_date = message.get("internalDate", "0")
+                text_body, html_body = _parse_body(message.get("payload", {}))
+
+                all_messages.append({
+                    "id": msg_id,
+                    "thread_id": message.get("threadId", ""),
+                    "date": _format_date(internal_date),
+                    "from": headers.get("From", "(unknown)"),
+                    "to": headers.get("To", "(unknown)"),
+                    "subject": headers.get("Subject", "(no subject)"),
+                    "snippet": message.get("snippet", ""),
+                    "labels": message.get("labelIds", []),
+                    "text_body": text_body,
+                    "html_body": html_body,
+                })
+            except HttpError as e:
+                logger.warning("Skipping message %s during export: %s", msg_id, e)
 
         summary = f"Exported {len(all_messages)} message(s) from {start_date} to {end_date}"
         if truncated:

@@ -64,7 +64,7 @@ def fetch_message_details(
                     userId="me",
                     id=mid,
                     format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
+                    metadataHeaders=["From", "To", "Subject", "Date"],
                     fields=MESSAGE_DETAIL_FIELDS,
                 )
                 .execute(),
@@ -87,7 +87,7 @@ def fetch_message_details(
             "snippet": snippet,
         }
         if include_thread_id:
-            entry["thread_id"] = msg.get("threadId", "")
+            entry["thread_id"] = detail.get("threadId", "")
         message_data.append(entry)
 
     return message_data
