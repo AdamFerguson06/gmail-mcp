@@ -3,6 +3,18 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Tunable constants with environment variable overrides.
+# Gmail API quota: 250 units/user/second. Default 25 req/sec = 125 units/sec (50% of limit).
+GMAIL_RATE_LIMIT_RPS = int(os.getenv("GMAIL_RATE_LIMIT_RPS", "25"))
+GMAIL_MAX_RETRIES = int(os.getenv("GMAIL_MAX_RETRIES", "3"))
+GMAIL_RETRY_BASE_WAIT = float(os.getenv("GMAIL_RETRY_BASE_WAIT", "2.0"))
+MAX_PAGES = int(os.getenv("GMAIL_MAX_PAGES", "1000"))
+MAX_MESSAGES_IN_MEMORY = int(os.getenv("GMAIL_MAX_MESSAGES_IN_MEMORY", "10000"))
+MCP_EXPORT_LIMIT = int(os.getenv("GMAIL_MCP_EXPORT_LIMIT", "100"))
+MAX_MIME_DEPTH = int(os.getenv("GMAIL_MAX_MIME_DEPTH", "50"))
+SNIPPET_MAX_LENGTH = int(os.getenv("GMAIL_SNIPPET_MAX_LENGTH", "150"))
+MAX_QUERY_LENGTH = int(os.getenv("GMAIL_MAX_QUERY_LENGTH", "2000"))
+
 
 def load_config() -> dict:
     """Load Gmail OAuth credentials from ~/.env and return a config dict.
