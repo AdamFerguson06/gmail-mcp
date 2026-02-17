@@ -34,11 +34,22 @@ def load_config() -> dict:
             f"Missing required environment variables in ~/.env: {', '.join(missing)}"
         )
 
+    client_id = os.getenv("GMAIL_CLIENT_ID")
+
+    # Validate client_id format early to give a clear error
+    # before it manifests as a cryptic OAuth failure later.
+    if client_id and not client_id.endswith(".apps.googleusercontent.com"):
+        raise EnvironmentError(
+            f"GMAIL_CLIENT_ID appears to be malformed: '{client_id}'\n"
+            "A valid Google OAuth 2.0 client ID ends with '.apps.googleusercontent.com'.\n"
+            "Please check your credentials in Google Cloud Console > APIs & Services > Credentials."
+        )
+
     # GMAIL_REFRESH_TOKEN is optional during initial auth setup
     refresh_token = os.getenv("GMAIL_REFRESH_TOKEN")
 
     return {
-        "client_id": os.getenv("GMAIL_CLIENT_ID"),
+        "client_id": client_id,
         "client_secret": os.getenv("GMAIL_CLIENT_SECRET"),
         "refresh_token": refresh_token,
     }
