@@ -1,16 +1,161 @@
-"""Email parsing, formatting, and display functions."""
+"""Email parsing, formatting, and display functions.
+
+Provides both shared data-fetching functions (used by CLI and MCP server)
+and CLI-specific print/export functions.
+"""
 
 import base64
 import binascii
 import json
-import sys
+import logging
 from datetime import datetime
-from typing import Optional
 
+from googleapiclient.errors import HttpError
 from tabulate import tabulate
 
 from gmail_reader.client import execute_gmail_request
-from gmail_reader.queries import build_date_query
+from gmail_reader.config import (
+    MAX_MESSAGES_IN_MEMORY,
+    MAX_MIME_DEPTH,
+    MAX_PAGES,
+    SNIPPET_MAX_LENGTH,
+)
+from gmail_reader.queries import (
+    LABEL_FIELDS,
+    MESSAGE_DETAIL_FIELDS,
+    MESSAGE_FULL_FIELDS,
+    MESSAGE_LIST_FIELDS,
+    THREAD_FIELDS,
+    build_date_query,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared data-fetching functions (used by both CLI and MCP server)
+# ---------------------------------------------------------------------------
+
+
+def fetch_message_details(
+    service,
+    messages: list[dict],
+    include_thread_id: bool = False,
+) -> list[dict]:
+    """Fetch metadata details for a list of message stubs.
+
+    Args:
+        service: Gmail API service object
+        messages: List of message dicts with at least "id" key (from messages.list)
+        include_thread_id: If True, include threadId in output
+
+    Returns:
+        List of dicts with id, date, from, to, subject, snippet (and optionally thread_id)
+    """
+    message_data = []
+    for msg in messages:
+        msg_id = msg["id"]
+        try:
+            detail = execute_gmail_request(
+                service,
+                lambda mid=msg_id: service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=mid,
+                    format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"],
+                    fields=MESSAGE_DETAIL_FIELDS,
+                )
+                .execute(),
+                operation_name="get message metadata",
+            )
+        except HttpError as e:
+            logger.warning("Skipping message %s: %s", msg_id, e)
+            continue
+
+        headers = _parse_headers(detail.get("payload", {}))
+        internal_date = detail.get("internalDate", "0")
+        snippet = detail.get("snippet", "")
+
+        entry = {
+            "id": msg_id,
+            "date": _format_date(internal_date),
+            "from": headers.get("From", "(unknown)"),
+            "to": headers.get("To", "(unknown)"),
+            "subject": headers.get("Subject", "(no subject)"),
+            "snippet": snippet,
+        }
+        if include_thread_id:
+            entry["thread_id"] = msg.get("threadId", "")
+        message_data.append(entry)
+
+    return message_data
+
+
+def fetch_message_full_detail(service, message_id: str) -> dict:
+    """Fetch full message content by ID.
+
+    Args:
+        service: Gmail API service object
+        message_id: Gmail message ID
+
+    Returns:
+        Full Gmail message resource dict
+    """
+    return execute_gmail_request(
+        service,
+        lambda: service.users()
+        .messages()
+        .get(userId="me", id=message_id, fields=MESSAGE_FULL_FIELDS)
+        .execute(),
+        operation_name="get message detail",
+    )
+
+
+def fetch_thread_details(service, thread_id: str) -> dict:
+    """Fetch a thread with all its messages.
+
+    Args:
+        service: Gmail API service object
+        thread_id: Gmail thread ID
+
+    Returns:
+        Gmail thread resource dict with "messages" list
+    """
+    return execute_gmail_request(
+        service,
+        lambda: service.users()
+        .threads()
+        .get(userId="me", id=thread_id, fields=THREAD_FIELDS)
+        .execute(),
+        operation_name="get thread",
+    )
+
+
+def fetch_labels(service) -> list[dict]:
+    """Fetch all Gmail labels.
+
+    Args:
+        service: Gmail API service object
+
+    Returns:
+        List of label dicts with id, name, type
+    """
+    result = execute_gmail_request(
+        service,
+        lambda: service.users()
+        .labels()
+        .list(userId="me", fields=LABEL_FIELDS)
+        .execute(),
+        operation_name="list labels",
+    )
+    return result.get("labels", [])
+
+
+# ---------------------------------------------------------------------------
+# CLI display functions
+# ---------------------------------------------------------------------------
 
 
 def print_message_list(
@@ -30,36 +175,20 @@ def print_message_list(
         print("No messages found.")
         return
 
-    # Fetch full details for each message (for headers)
-    message_data = []
-    for msg in messages:
-        msg_id = msg["id"]
-        detail = execute_gmail_request(
-            service,
-            lambda: service.users()
-            .messages()
-            .get(userId="me", id=msg_id, format="metadata", metadataHeaders=["From", "Subject", "Date"])
-            .execute(),
-        )
+    message_data = fetch_message_details(service, messages)
 
-        headers = _parse_headers(detail.get("payload", {}))
-        internal_date = detail.get("internalDate", "0")
-        snippet = detail.get("snippet", "")
+    if not message_data:
+        print("No messages found.")
+        return
 
-        message_data.append(
-            {
-                "id": msg_id,
-                "date": _format_date(internal_date),
-                "from": headers.get("From", "(unknown)"),
-                "subject": headers.get("Subject", "(no subject)"),
-                "snippet": snippet[:100] + ("..." if len(snippet) > 100 else ""),
-            }
-        )
+    # Truncate snippets for table display
+    for m in message_data:
+        snippet = m["snippet"]
+        m["snippet"] = snippet[:100] + ("..." if len(snippet) > 100 else "")
 
     if output_format == "json":
         print(json.dumps(message_data, indent=2))
     else:
-        # Table format
         headers = ["ID", "Date", "From", "Subject", "Snippet"]
         rows = [
             [m["id"], m["date"], m["from"], m["subject"], m["snippet"]]
@@ -79,16 +208,12 @@ def print_message_detail(
         output_format: "table" or "json"
         detail_level: "full" or "snippet"
     """
-    message = execute_gmail_request(
-        service,
-        lambda: service.users().messages().get(userId="me", id=message_id).execute(),
-    )
+    message = fetch_message_full_detail(service, message_id)
 
     if output_format == "json":
         print(json.dumps(message, indent=2))
         return
 
-    # Table format
     headers = _parse_headers(message.get("payload", {}))
     snippet = message.get("snippet", "")
     internal_date = message.get("internalDate", "0")
@@ -106,7 +231,6 @@ def print_message_detail(
     if detail_level == "snippet":
         print(f"\n{snippet}\n")
     else:
-        # Full body
         text_body, html_body = _parse_body(message.get("payload", {}))
 
         if text_body:
@@ -129,11 +253,7 @@ def print_thread_messages(service, thread_id, output_format="table"):
         thread_id: Gmail thread ID
         output_format: "table" or "json"
     """
-    thread = execute_gmail_request(
-        service,
-        lambda: service.users().threads().get(userId="me", id=thread_id).execute(),
-    )
-
+    thread = fetch_thread_details(service, thread_id)
     messages = thread.get("messages", [])
 
     if not messages:
@@ -144,7 +264,6 @@ def print_thread_messages(service, thread_id, output_format="table"):
         print(json.dumps(thread, indent=2))
         return
 
-    # Table format
     print(f"Thread ID: {thread_id}")
     print(f"Messages: {len(messages)}\n")
 
@@ -158,7 +277,7 @@ def print_thread_messages(service, thread_id, output_format="table"):
         print(f"Date: {_format_date(internal_date)}")
         print(f"From: {headers.get('From', '(unknown)')}")
         print(f"Subject: {headers.get('Subject', '(no subject)')}")
-        print(f"Snippet: {snippet[:150]}")
+        print(f"Snippet: {snippet[:SNIPPET_MAX_LENGTH]}")
         print()
 
 
@@ -169,11 +288,7 @@ def print_labels(service, output_format="table"):
         service: Gmail API service object
         output_format: "table" or "json"
     """
-    result = execute_gmail_request(
-        service, lambda: service.users().labels().list(userId="me").execute()
-    )
-
-    labels = result.get("labels", [])
+    labels = fetch_labels(service)
 
     if not labels:
         print("No labels found.")
@@ -183,7 +298,6 @@ def print_labels(service, output_format="table"):
         print(json.dumps(labels, indent=2))
         return
 
-    # Table format
     headers = ["ID", "Name", "Type"]
     rows = [[label["id"], label["name"], label.get("type", "")] for label in labels]
     print(tabulate(rows, headers=headers, tablefmt="grid"))
@@ -192,7 +306,7 @@ def print_labels(service, output_format="table"):
 def export_messages_to_json(service, start_date, end_date, output_file):
     """Export all messages in date range to JSON file.
 
-    CRITICAL: Streams to file to avoid memory overflow on large exports.
+    Streams to file to avoid memory overflow on large exports.
 
     Args:
         service: Gmail API service object
@@ -205,9 +319,8 @@ def export_messages_to_json(service, start_date, end_date, output_file):
 
     print(f"Exporting {len(message_ids)} messages to {output_file}...")
 
-    # Wrap export in try/except so partial-write failures are reported
-    # clearly instead of leaving an invalid JSON file with no error message.
     exported_count = 0
+    skipped_count = 0
     try:
         with open(output_file, "w") as f:
             f.write("[\n")
@@ -215,15 +328,21 @@ def export_messages_to_json(service, start_date, end_date, output_file):
 
             for i, msg_id in enumerate(message_ids, 1):
                 if i % 100 == 0:
-                    print(f"Progress: {i}/{len(message_ids)} messages exported...")
+                    logger.info("Export progress: %d/%d messages", i, len(message_ids))
 
-                message = execute_gmail_request(
-                    service,
-                    lambda: service.users()
-                    .messages()
-                    .get(userId="me", id=msg_id)
-                    .execute(),
-                )
+                try:
+                    message = execute_gmail_request(
+                        service,
+                        lambda mid=msg_id: service.users()
+                        .messages()
+                        .get(userId="me", id=mid, fields=MESSAGE_FULL_FIELDS)
+                        .execute(),
+                        operation_name="export message",
+                    )
+                except HttpError as e:
+                    logger.warning("Skipping message %s during export: %s", msg_id, e)
+                    skipped_count += 1
+                    continue
 
                 if not first:
                     f.write(",\n")
@@ -233,15 +352,22 @@ def export_messages_to_json(service, start_date, end_date, output_file):
 
             f.write("\n]\n")
     except Exception as e:
-        print(
-            f"Error: Export failed after writing {exported_count}/{len(message_ids)} messages. "
-            f"Output file '{output_file}' may be incomplete or invalid JSON. "
-            f"Reason: {e}",
-            file=sys.stderr,
+        logger.error(
+            "Export failed after writing %d/%d messages. "
+            "Output file '%s' may be incomplete. Reason: %s",
+            exported_count, len(message_ids), output_file, e,
         )
         raise
 
-    print(f"✅ Export complete: {len(message_ids)} messages saved to {output_file}")
+    summary = f"Export complete: {exported_count} messages saved to {output_file}"
+    if skipped_count:
+        summary += f" ({skipped_count} messages skipped due to errors)"
+    print(summary)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _fetch_all_messages(service, query=None, max_results=None):
@@ -257,31 +383,23 @@ def _fetch_all_messages(service, query=None, max_results=None):
     Returns:
         list of message dicts with 'id' and 'threadId'
     """
-    # Guard against infinite pagination from duplicate nextPageToken.
-    # Also enforces a hard page limit as a safety net.
-    _MAX_PAGES = 1000
-
-    # Hard memory limit to prevent 100MB+ RAM usage on large inboxes
-    _MAX_MESSAGES_IN_MEMORY = 10000
-
     seen_tokens: set = set()
-
     all_messages = []
     page_token = None
     page_count = 0
 
     while True:
-        if page_count >= _MAX_PAGES:
-            print(
-                f"Warning: Reached maximum page limit ({_MAX_PAGES}). "
-                "Returning partial results.",
-                file=sys.stderr,
+        if page_count >= MAX_PAGES:
+            logger.warning(
+                "Reached maximum page limit (%d). Returning partial results.",
+                MAX_PAGES,
             )
             break
 
         params = {
             "userId": "me",
-            "maxResults": min(500, max_results or 500),  # API max per page
+            "maxResults": min(500, max_results or 500),
+            "fields": "messages(id,threadId),nextPageToken",
         }
         if query:
             params["q"] = query
@@ -289,24 +407,29 @@ def _fetch_all_messages(service, query=None, max_results=None):
             params["pageToken"] = page_token
 
         result = execute_gmail_request(
-            service, lambda: service.users().messages().list(**params).execute()
+            service,
+            lambda p=dict(params): service.users().messages().list(**p).execute(),
+            operation_name="list messages",
         )
 
         messages = result.get("messages", [])
         all_messages.extend(messages)
         page_count += 1
 
-        # Enforce hard memory limit
-        if len(all_messages) >= _MAX_MESSAGES_IN_MEMORY:
-            print(
-                f"Warning: Reached maximum in-memory message limit ({_MAX_MESSAGES_IN_MEMORY}). "
-                "Returning partial results to avoid excessive memory usage. "
-                "Use --start-date/--end-date to narrow the query.",
-                file=sys.stderr,
+        if page_count % 5 == 0:
+            logger.debug(
+                "Pagination progress: page %d, %d messages so far",
+                page_count, len(all_messages),
             )
-            return all_messages[:_MAX_MESSAGES_IN_MEMORY]
 
-        # Check if we've hit user's max_results limit
+        if len(all_messages) >= MAX_MESSAGES_IN_MEMORY:
+            logger.warning(
+                "Reached maximum in-memory message limit (%d). "
+                "Returning partial results. Use date filters to narrow the query.",
+                MAX_MESSAGES_IN_MEMORY,
+            )
+            return all_messages[:MAX_MESSAGES_IN_MEMORY]
+
         if max_results and len(all_messages) >= max_results:
             return all_messages[:max_results]
 
@@ -314,12 +437,10 @@ def _fetch_all_messages(service, query=None, max_results=None):
         if not new_page_token:
             break
 
-        # Detect duplicate nextPageToken to prevent infinite loop
         if new_page_token in seen_tokens:
-            print(
-                f"Warning: Duplicate nextPageToken detected at page {page_count}. "
-                "Stopping pagination to prevent infinite loop.",
-                file=sys.stderr,
+            logger.warning(
+                "Duplicate nextPageToken at page %d. Stopping pagination.",
+                page_count,
             )
             break
 
@@ -343,7 +464,7 @@ def _fetch_all_message_ids(service, query=None):
     return [msg["id"] for msg in messages]
 
 
-def _parse_headers(payload) -> dict:
+def _parse_headers(payload: dict) -> dict:
     """Extract common headers from message payload.
 
     Args:
@@ -369,11 +490,7 @@ def _parse_headers(payload) -> dict:
     return headers
 
 
-# Limit recursive MIME parsing depth to prevent stack overflow on deeply nested messages
-_MAX_MIME_DEPTH = 50
-
-
-def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
+def _parse_body(payload: dict, depth: int = 0) -> tuple[str, str]:
     """Extract text and HTML body from message payload.
 
     Handles:
@@ -390,12 +507,10 @@ def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
     Returns:
         tuple of (text_body, html_body)
     """
-    # Guard against deeply nested multipart messages
-    if depth > _MAX_MIME_DEPTH:
-        print(
-            f"Warning: MIME parsing exceeded maximum depth ({_MAX_MIME_DEPTH}). "
-            "Skipping remaining nested parts.",
-            file=sys.stderr,
+    if depth > MAX_MIME_DEPTH:
+        logger.warning(
+            "MIME parsing exceeded maximum depth (%d). Skipping remaining nested parts.",
+            MAX_MIME_DEPTH,
         )
         return "", ""
 
@@ -403,7 +518,6 @@ def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
     html_body = ""
 
     try:
-        # Check for simple body (non-multipart)
         if "body" in payload and payload["body"].get("data"):
             data = base64.urlsafe_b64decode(payload["body"]["data"])
             mime_type = payload.get("mimeType", "text/plain")
@@ -415,7 +529,6 @@ def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
 
             return text_body, html_body
 
-        # Handle multipart messages
         parts = payload.get("parts", [])
         for part in parts:
             mime_type = part.get("mimeType", "")
@@ -429,13 +542,15 @@ def _parse_body(payload, depth: int = 0) -> tuple[str, str]:
                 html_body = _decode_bytes(data)
 
             elif "parts" in part:
-                # Nested multipart — pass incremented depth
                 nested_text, nested_html = _parse_body(part, depth=depth + 1)
                 text_body = text_body or nested_text
                 html_body = html_body or nested_html
 
     except (KeyError, ValueError, UnicodeDecodeError, binascii.Error) as e:
-        print(f"Warning: Failed to parse message body: {e}", file=sys.stderr)
+        logger.warning(
+            "Failed to parse message body (mimeType=%s): %s",
+            payload.get("mimeType", "unknown"), e,
+        )
         return "(parsing error)", "(parsing error)"
 
     return text_body, html_body
@@ -460,7 +575,6 @@ def _decode_bytes(data: bytes) -> str:
             return data.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-    # Last resort: replace undecodable bytes
     return data.decode("utf-8", errors="replace")
 
 
@@ -478,4 +592,5 @@ def _format_date(internal_date: str) -> str:
         dt = datetime.fromtimestamp(timestamp_sec)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, OSError):
+        logger.debug("Invalid internalDate value: %r", internal_date)
         return "(invalid date)"
