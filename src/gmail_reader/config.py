@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 # Tunable constants with environment variable overrides.
 # Gmail API quota: 250 units/user/second. Default 25 req/sec = 125 units/sec (50% of limit).
-GMAIL_RATE_LIMIT_RPS = int(os.getenv("GMAIL_RATE_LIMIT_RPS", "25"))
+GMAIL_RATE_LIMIT_RPS = max(1, int(os.getenv("GMAIL_RATE_LIMIT_RPS", "25")))
 GMAIL_MAX_RETRIES = int(os.getenv("GMAIL_MAX_RETRIES", "3"))
 GMAIL_RETRY_BASE_WAIT = float(os.getenv("GMAIL_RETRY_BASE_WAIT", "2.0"))
 MAX_PAGES = int(os.getenv("GMAIL_MAX_PAGES", "1000"))
